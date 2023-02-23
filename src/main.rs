@@ -24,7 +24,7 @@ impl Display for TrackRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(data) = &self.header {
             write!(f, 
-                "session[{sid}]\n{p}\n-----------------split-----------------\n", 
+                "session[{sid}]\r\n{p}\r\n----------------------------------", 
                 sid = self.session_id, p = data)
         } else {
             write!(f, "")
