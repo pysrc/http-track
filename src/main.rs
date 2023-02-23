@@ -120,6 +120,7 @@ async fn handle(mut stream: TcpStream, dst: SocketAddr, tx: Sender<TrackRecord>)
             // 一个循环读一次http请求/响应
             let mut body_len = 0usize;
             let mut chunked = false;
+            let mut _gzip = false;
             let mut body_start = false;
             let mut header = Vec::<u8>::with_capacity(1024);
             let uid = uuid::Uuid::new_v4().to_string();
@@ -151,6 +152,9 @@ async fn handle(mut stream: TcpStream, dst: SocketAddr, tx: Sender<TrackRecord>)
                 }
                 if ever_read.starts_with(b"Transfer-Encoding: chunked") {
                     chunked = true;
+                }
+                if ever_read.starts_with(b"Content-Encoding: gzip") {
+                    _gzip = true;
                 }
                 if body_start && chunked {
                     body.extend(&ever_read);
@@ -204,6 +208,7 @@ async fn handle(mut stream: TcpStream, dst: SocketAddr, tx: Sender<TrackRecord>)
             let mut must_close = false;
             let mut body_len = 0usize;
             let mut body_start = false;
+            let mut _gzip = false;
             let mut chunked = false;
             let mut header = Vec::<u8>::with_capacity(1024);
             let sid = s2.lock().await.take();
@@ -233,6 +238,9 @@ async fn handle(mut stream: TcpStream, dst: SocketAddr, tx: Sender<TrackRecord>)
                 }
                 if ever_read.starts_with(b"Transfer-Encoding: chunked") {
                     chunked = true;
+                }
+                if ever_read.starts_with(b"Content-Encoding: gzip") {
+                    _gzip = true;
                 }
                 if body_start && chunked {
                     body.extend(&ever_read);
