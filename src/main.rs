@@ -4,7 +4,7 @@ use std::{net::{IpAddr, Ipv4Addr, SocketAddr}, time::{SystemTime, UNIX_EPOCH}, f
 
 use rusqlite::Connection;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt, AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     spawn,
     task::JoinHandle, sync::{mpsc::{channel, Sender}, Mutex},
@@ -24,14 +24,11 @@ impl Display for TrackRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(data) = &self.header {
             write!(f, 
-                "\nsession_id = {sid}\ndata_type = {dt}\nstart_time = {st}\nend_time = {et}\nheader = {p}\n-----------------split-----------------\n", 
-                sid = self.session_id, dt = self.data_type, st = self.start_time, et = self.end_time, p = data)
+                "session[{sid}]\n{p}\n-----------------split-----------------\n", 
+                sid = self.session_id, p = data)
         } else {
-            write!(f, 
-                "\nsession_id = {sid}\ndata_type = {dt}\nstart_time = {st}\nend_time = {et}\npayload = null\n-----------------split-----------------\n",
-                sid = self.session_id, dt = self.data_type, st = self.start_time, et = self.end_time)
+            write!(f, "")
         }
-        
     }
 }
 
@@ -78,7 +75,7 @@ async fn main() {
                 &r.header,
                 &r.payload
             )).unwrap();
-            log::info!("track {}", r);
+            log::info!("{}", r);
         }
         
     }));
@@ -106,182 +103,122 @@ async fn run(cfg: config::Server, tx: Sender<TrackRecord>) {
 }
 
 async fn handle(mut stream: TcpStream, dst: SocketAddr, tx: Sender<TrackRecord>) {
+    log::info!("Swap start for {:?}", dst);
     let mut dst_stream = TcpStream::connect(dst).await.unwrap();
     let (mut ro, mut wo) = stream.split();
     let (mut rd, mut wd) = dst_stream.split();
     let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    tokio::join!(
+        async {copy_handle(&mut ro, &mut wd, true, session_id.clone(), tx.clone()).await}, 
+        async {copy_handle(&mut rd, &mut wo, false, session_id.clone(), tx.clone()).await}
+    );
+    log::info!("Swap over for {:?}", dst);
+}
 
-    let s1 = async {
-        let mut ro = BufReader::new(&mut ro);
-
-        let mut ever_read = Vec::<u8>::with_capacity(1024);
-        loop {
-            let mut must_close = false;
-            // 一个循环读一次http请求/响应
-            let mut body_len = 0usize;
-            let mut chunked = false;
-            let mut _gzip = false;
-            let mut body_start = false;
-            let mut header = Vec::<u8>::with_capacity(1024);
+async fn copy_handle<'a, R, W>(mut r: &'a mut R, w: &'a mut W, upstream: bool, session_id: Arc<Mutex<Option<String>>>, tx: Sender<TrackRecord>)
+where
+        R: AsyncRead + Unpin + ?Sized,
+        W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut ro = BufReader::new(&mut r);
+    let mut ever_read = Vec::<u8>::with_capacity(1024);
+    loop {
+        // 一个循环读一次http请求/响应
+        let mut body_len = 0usize;
+        let mut chunked = false;
+        let mut _gzip = false;
+        let mut body_start = false;
+        let mut _is_emp = true;
+        let mut _must_close = false;
+        let mut header = Vec::<u8>::with_capacity(1024);
+        ever_read.clear();
+        if let Err(_) = ro.read_until(b'\n', &mut ever_read).await {
+            break;
+        }
+        if ever_read.len() == 0 {
+            break;
+        }
+        w.write_all(&ever_read).await.unwrap();
+        header.extend(&ever_read);
+        let mut uidn: Option<String> = None;
+        if upstream {
             let uid = uuid::Uuid::new_v4().to_string();
-            session_id.lock().await.replace(uid.clone());
-            let mut rcd = TrackRecord{
-                session_id: uid,
-                data_type: String::from("request"),
-                start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                end_time: 0,
-                header: None,
-                payload: None
-            };
-            let mut body = Vec::<u8>::with_capacity(1024);
-            loop {
-                ever_read.clear();
-                if let Err(_) = ro.read_until(b'\n', &mut ever_read).await {
-                    must_close = true;
-                    break;
-                }
-                if ever_read.len() == 0 {
-                    must_close = true;
-                    break;
-                }
-                
-                wd.write_all(&ever_read).await.unwrap();
-                if ever_read.starts_with(b"Content-Length: ") {
-                    let klen = &ever_read[16..ever_read.len() - 2];
-                    body_len = String::from_utf8_lossy(klen).parse::<usize>().unwrap();
-                }
-                if ever_read.starts_with(b"Transfer-Encoding: chunked") {
-                    chunked = true;
-                }
-                if ever_read.starts_with(b"Content-Encoding: gzip") {
-                    _gzip = true;
-                }
-                if body_start && chunked {
-                    body.extend(&ever_read);
-                    if body.ends_with(b"0\r\n\r\n") {
-                        // chunked 结束
-                        break;
-                    }
-                } else {
-                    header.extend(&ever_read);
-                }
-                
-                if ever_read == b"\r\n" {
-                    if body_len != 0 {
-                        let mut body2 = Vec::<u8>::with_capacity(body_len);
-                        unsafe {
-                            body2.set_len(body_len);
-                        }
-                        ro.read_exact(&mut body2).await.unwrap();
-                        wd.write_all(&body2).await.unwrap();
-                        body.clear();
-                        body.extend(&body2);
-                        // 这里读完
-                        break;
-                    } else if chunked {
-                        body_start = true;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            rcd.end_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let header = String::from_utf8_lossy(&header);
-            rcd.header = Some(header.to_string());
-            rcd.payload = Some(body);
-            tx.send(rcd).await.unwrap();
-            if must_close {
-                break;
-            }
+            *session_id.lock().await = Some(uid.clone());
+            uidn.replace(uid.clone());
+        } else {
+            let mut sid = session_id.lock().await;
+            let uid = sid.take();
+            uidn.replace(uid.unwrap());
         }
-        wd.flush().await.unwrap();
-        wd.shutdown().await.unwrap();
-    };
-    let s2 = session_id.clone();
-    let s2 = async {
-        let mut rd = BufReader::new(&mut rd);
-
-        let mut ever_read = Vec::<u8>::with_capacity(1024);
         
+        let mut rcd = TrackRecord{
+            session_id: uidn.unwrap(),
+            data_type: if upstream { String::from("request") } else {String::from("response")},
+            start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            end_time: 0,
+            header: None,
+            payload: None
+        };
+        let mut body = Vec::<u8>::with_capacity(1024);
         loop {
-            // 一个循环读一次http请求/响应
-            let mut must_close = false;
-            let mut body_len = 0usize;
-            let mut body_start = false;
-            let mut _gzip = false;
-            let mut chunked = false;
-            let mut header = Vec::<u8>::with_capacity(1024);
-            let sid = s2.lock().await.take();
-            let mut rcd = TrackRecord{
-                session_id: sid.unwrap(),
-                data_type: String::from("response"),
-                start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                end_time: 0,
-                header: None,
-                payload: None
-            };
-            let mut body = Vec::<u8>::with_capacity(1024);
-            loop {
-                ever_read.clear();
-                if let Err(_) = rd.read_until(b'\n', &mut ever_read).await {
-                    must_close = true;
-                    break;
-                }
-                if ever_read.len() == 0 {
-                    must_close = true;
-                    break;
-                }
-                wo.write_all(&ever_read).await.unwrap();
-                if ever_read.starts_with(b"Content-Length: ") {
-                    let klen = &ever_read[16..ever_read.len() - 2];
-                    body_len = String::from_utf8_lossy(klen).parse::<usize>().unwrap();
-                }
-                if ever_read.starts_with(b"Transfer-Encoding: chunked") {
-                    chunked = true;
-                }
-                if ever_read.starts_with(b"Content-Encoding: gzip") {
-                    _gzip = true;
-                }
-                if body_start && chunked {
-                    body.extend(&ever_read);
-                    if body.ends_with(b"0\r\n\r\n") {
-                        // chunked 结束
-                        break;
-                    }
-                } else {
-                    header.extend(&ever_read);
-                }
-                
-                if ever_read == b"\r\n" {
-                    if body_len != 0 {
-                        let mut body2 = Vec::<u8>::with_capacity(body_len);
-                        unsafe {
-                            body2.set_len(body_len);
-                        }
-                        rd.read_exact(&mut body2).await.unwrap();
-                        wo.write_all(&body2).await.unwrap();
-                        body.clear();
-                        body.extend(&body2);
-                        // 这里读完
-                        break;
-                    } else if chunked {
-                        body_start = true;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            rcd.end_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let header = String::from_utf8_lossy(&header);
-            rcd.header = Some(header.to_string());
-            rcd.payload = Some(body);
-            tx.send(rcd).await.unwrap();
-            if must_close {
+            ever_read.clear();
+            if let Err(_) = ro.read_until(b'\n', &mut ever_read).await {
+                _must_close = true;
                 break;
             }
+            if ever_read.len() == 0 {
+                _must_close = true;
+                break;
+            }
+            w.write_all(&ever_read).await.unwrap();
+            if ever_read.starts_with(b"Content-Length: ") {
+                let klen = &ever_read[16..ever_read.len() - 2];
+                body_len = String::from_utf8_lossy(klen).parse::<usize>().unwrap();
+            }
+            if ever_read.starts_with(b"Transfer-Encoding: chunked") {
+                chunked = true;
+            }
+            if ever_read.starts_with(b"Content-Encoding: gzip") {
+                _gzip = true;
+            }
+            if body_start && chunked {
+                body.extend(&ever_read);
+                if body.ends_with(b"0\r\n\r\n") {
+                    // chunked 结束
+                    break;
+                }
+            } else {
+                header.extend(&ever_read);
+            }
+            
+            if ever_read == b"\r\n" {
+                if body_len != 0 {
+                    let mut body2 = Vec::<u8>::with_capacity(body_len);
+                    unsafe {
+                        body2.set_len(body_len);
+                    }
+                    ro.read_exact(&mut body2).await.unwrap();
+                    w.write_all(&body2).await.unwrap();
+                    body.clear();
+                    body.extend(&body2);
+                    // 这里读完
+                    break;
+                } else if chunked {
+                    body_start = true;
+                } else {
+                    break;
+                }
+            }
         }
-        wo.flush().await.unwrap();
-        wo.shutdown().await.unwrap();
-    };
-    tokio::join!(s1, s2);
+        rcd.end_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let header = String::from_utf8_lossy(&header);
+        rcd.header = Some(header.to_string());
+        rcd.payload = Some(body);
+        tx.send(rcd).await.unwrap();
+        if _must_close {
+            break;
+        }
+    }
+    let _ = w.flush().await;
+    let _ = w.shutdown().await;
 }
